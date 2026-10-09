@@ -171,23 +171,19 @@ static ModResult add_limit_controls(
 
 // Builds the in-game panel containing all capacity controls.
 static ModResult build_capacity_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
-    ModResult result = add_limit_controls(panel, "Rupee Limits", s_walletLimits,
-        kWalletCount);
+    ModResult result = add_limit_controls(panel, "Rupee Limits", s_walletLimits, kWalletCount);
     if (result != MOD_OK) {
         return result;
     }
-    result = add_limit_controls(panel, "Quiver Limits", s_quiverLimits,
-        kQuiverCount);
+    result = add_limit_controls(panel, "Quiver Limits", s_quiverLimits, kQuiverCount);
     if (result != MOD_OK) {
         return result;
     }
-    result = add_limit_controls(panel, "Bomb Bag Limits", s_bombLimits,
-        kBombCount);
+    result = add_limit_controls(panel, "Bomb Bag Limits", s_bombLimits, kBombCount);
     if (result != MOD_OK) {
         return result;
     }
-    return add_limit_controls(
-        panel, "Slingshot Limit", s_pelletLimit, kPelletCount);
+    return add_limit_controls(panel, "Slingshot Limit", s_pelletLimit, kPelletCount);
 }
 
 // Registers the capacity settings panel with the Mods UI.
@@ -200,7 +196,7 @@ static ModResult register_capacity_panel() {
 // Overrides the rupee maximum for the player's current wallet when configured.
 static void on_max_rupee_post(ModContext*, void* args, void* retval, void*) {
     const auto* playerStatus = mods::arg<const dSv_player_status_a_c*>(args, 0);
-    const u8 walletSize = playerStatus->getWalletSize();
+	const u8 walletSize = playerStatus->getWalletSize(); // Returns the index of the current wallet size (0 = base, 1 = big, 2 = giant)
     if (walletSize < kWalletCount && s_walletLimits[walletSize].value > 0) {
         *static_cast<u16*>(retval) = s_walletLimits[walletSize].value;
     }
@@ -208,24 +204,15 @@ static void on_max_rupee_post(ModContext*, void* args, void* retval, void*) {
 
 // Overrides the arrow maximum for the player's current quiver when configured.
 static void on_max_arrow_post(ModContext*, void*, void* retval, void*) {
-    auto& currentMax = *static_cast<u8*>(retval);
-    size_t quiverIndex;
-    switch (currentMax) {
-    case QUIVER_MAX:
-        quiverIndex = 0;
-        break;
-    case BIG_QUIVER_MAX:
-        quiverIndex = 1;
-        break;
-    case GIANT_QUIVER_MAX:
+    size_t quiverIndex = 0; // Base Quiver
+    if (dComIfGs_isItemFirstBit(dItemNo_ARROW_LV3_e)) { // Giant Quiver
         quiverIndex = 2;
-        break;
-    default:
-        return;
+    } else if (dComIfGs_isItemFirstBit(dItemNo_ARROW_LV2_e)) { // Big Quiver
+        quiverIndex = 1;
     }
 
     if (s_quiverLimits[quiverIndex].value > 0) {
-        currentMax = static_cast<u8>(s_quiverLimits[quiverIndex].value);
+        *static_cast<u8*>(retval) = static_cast<u8>(s_quiverLimits[quiverIndex].value);
     }
 }
 
@@ -234,21 +221,21 @@ static void on_max_bomb_post(ModContext*, void* args, void* retval, void*) {
     const u8 bombType = mods::arg<u8>(args, 1);
     size_t bombIndex;
     switch (bombType) {
-    case dItemNo_NORMAL_BOMB_e:
+    case dItemNo_NORMAL_BOMB_e: // Regular Bombs
         bombIndex = 0;
         break;
-    case dItemNo_WATER_BOMB_e:
-        bombIndex = 2;
+    case dItemNo_WATER_BOMB_e: // Water Bombs
+        bombIndex = 1;
         break;
-    case dItemNo_POKE_BOMB_e:
-        bombIndex = 4;
+    case dItemNo_POKE_BOMB_e: // Bomblings
+        bombIndex = 2;
         break;
     default:
         return;
     }
 
-    if (dComIfGs_isItemFirstBit(dItemNo_BOMB_BAG_LV2_e)) {
-        ++bombIndex;
+    if (dComIfGs_isItemFirstBit(dItemNo_BOMB_BAG_LV2_e)) { // If the Giant Bomb Bag is obtained
+        bombIndex += 3;
     }
     if (s_bombLimits[bombIndex].value > 0) {
         *static_cast<u8*>(retval) = static_cast<u8>(s_bombLimits[bombIndex].value);
@@ -296,20 +283,16 @@ static void on_ring_draw_number_replace(ModContext*, void* args, void*, void*) {
         ring->mpItemNumTex[i]->setBlackWhite(colorBlack, colorWhite);
     }
 
-    ResTIMG* texture = static_cast<ResTIMG*>(dComIfGp_getMain2DArchive()->getResource(
-        'TIMG', dMeter2Info_getNumberTextureName(itemNum / 100)));
+    ResTIMG* texture = static_cast<ResTIMG*>(dComIfGp_getMain2DArchive()->getResource('TIMG', dMeter2Info_getNumberTextureName(itemNum / 100)));
     ring->mpItemNumTex[0]->changeTexture(texture, 0);
     const int remainder = itemNum % 100;
-    texture = static_cast<ResTIMG*>(dComIfGp_getMain2DArchive()->getResource(
-        'TIMG', dMeter2Info_getNumberTextureName(remainder / 10)));
+    texture = static_cast<ResTIMG*>(dComIfGp_getMain2DArchive()->getResource('TIMG', dMeter2Info_getNumberTextureName(remainder / 10)));
     ring->mpItemNumTex[1]->changeTexture(texture, 0);
-    texture = static_cast<ResTIMG*>(dComIfGp_getMain2DArchive()->getResource(
-        'TIMG', dMeter2Info_getNumberTextureName(remainder % 10)));
+    texture = static_cast<ResTIMG*>(dComIfGp_getMain2DArchive()->getResource('TIMG', dMeter2Info_getNumberTextureName(remainder % 10)));
     ring->mpItemNumTex[2]->changeTexture(texture, 0);
     ring->mpItemNumTex[2]->show();
 
-    const u8 itemIconAlpha = ring->mPlayerIsWolf != 0 ? g_ringHIO.mItemIconAlpha_Wolf
-                                                       : g_ringHIO.mItemIconAlpha;
+    const u8 itemIconAlpha = ring->mPlayerIsWolf != 0 ? g_ringHIO.mItemIconAlpha_Wolf: g_ringHIO.mItemIconAlpha;
     for (int i = 0; i < 3; ++i) {
         ring->mpItemNumTex[i]->setAlpha(itemIconAlpha * ring->mAlphaRate);
         ring->mpItemNumTex[i]->draw(posX + i * 16.0f, posY - 16.0f, 16.0f, 16.0f, 0, 0, 0);
