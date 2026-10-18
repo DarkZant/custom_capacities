@@ -6,14 +6,14 @@
 #include "mods/svc/ui.h"
 
 // Game includes
-#include "d/dolzel_rel.h" // IWYU pragma: keep
-#include "d/d_save.h"
-#include "d/d_com_inf_game.h"
+#include "d/dolzel_rel.h"
 #include "d/d_meter2.h"
 #include "d/d_meter2_draw.h"
 #include "d/d_meter_HIO.h"
 #include "d/d_meter2_info.h"
 #include "d/d_menu_ring.h"
+#include "d/d_menu_collect.h"
+#include "d/d_msg_flow.h"
 
 #include "f_op/f_op_actor_mng.h" // For hooks
 
@@ -27,15 +27,20 @@ IMPORT_SERVICE(UiService, svc_ui);
 // Hooks the wallet-specific rupee maximum.
 DEFINE_HOOK_SYMBOL("dSv_player_status_a_c::getRupeeMax", u16(const dSv_player_status_a_c*), MaxRupee);
 // Hooks the current quiver's arrow maximum.
-DEFINE_HOOK_SYMBOL("dComIfGs_getArrowMax", u8(), MaxArrow);
+DEFINE_HOOK(&dComIfGs_getArrowMax, MaxArrow);
 // Hooks the maximum for a specific bomb type.
 DEFINE_HOOK_SYMBOL("dSv_player_item_max_c::getBombNum", u8(const dSv_player_item_max_c*, u8), MaxBomb);
-// Hooks slingshot pellet count updates.
+// Hooks slingshot pellet count updates. Cannot hook the max directly because the compiler optimizes the function away as it only returns 50.
+//DEFINE_HOOK(&dComIfGs_getPachinkoMax, MaxPellets); // This doesn't work.
 DEFINE_HOOK(&dMeter2_c::movePachinkoNum, MovePachinkoNum);
 // Replaces item-wheel count rendering to support three-digit values.
 DEFINE_HOOK(&dMenu_Ring_c::drawNumber, RingDrawNumber);
 // Hooks the item-wheel capacity used for its full-state color.
 DEFINE_HOOK(&dMenu_Ring_c::getItemMaxNum, RingGetItemMax);
+// Fixes the quiver display in the Collection screen
+DEFINE_HOOK(&dMenu_Collect2D_c::screenSet, CollectScreenSet);
+// Corrects the ability to buy arrows beyond the limit in a shop
+DEFINE_HOOK(&dMsgFlow_c::query024, ShopArrows);
 
 struct LimitSetting {
     const char* name;
@@ -72,6 +77,7 @@ static constexpr size_t kWalletCount = sizeof(s_walletLimits) / sizeof(s_walletL
 static constexpr size_t kQuiverCount = sizeof(s_quiverLimits) / sizeof(s_quiverLimits[0]);
 static constexpr size_t kBombCount = sizeof(s_bombLimits) / sizeof(s_bombLimits[0]);
 static constexpr size_t kPelletCount = sizeof(s_pelletLimit) / sizeof(s_pelletLimit[0]);
+// Necessary to handle the slingshot limit, as we can't simply modify the max
 static bool s_pelletMoveCaptured = false;
 static u8 s_pelletCountBefore = 0;
 static s16 s_pelletDeltaBefore = 0;
@@ -171,19 +177,19 @@ static ModResult add_limit_controls(
 
 // Builds the in-game panel containing all capacity controls.
 static ModResult build_capacity_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
-    ModResult result = add_limit_controls(panel, "Rupee Limits", s_walletLimits, kWalletCount);
+    ModResult result = add_limit_controls(panel, "Wallet Capacities", s_walletLimits, kWalletCount);
     if (result != MOD_OK) {
         return result;
     }
-    result = add_limit_controls(panel, "Quiver Limits", s_quiverLimits, kQuiverCount);
+    result = add_limit_controls(panel, "Quiver Capacities", s_quiverLimits, kQuiverCount);
     if (result != MOD_OK) {
         return result;
     }
-    result = add_limit_controls(panel, "Bomb Bag Limits", s_bombLimits, kBombCount);
+    result = add_limit_controls(panel, "Bomb Bag Capacities", s_bombLimits, kBombCount);
     if (result != MOD_OK) {
         return result;
     }
-    return add_limit_controls(panel, "Slingshot Limit", s_pelletLimit, kPelletCount);
+    return add_limit_controls(panel, "Slingshot Capacities", s_pelletLimit, kPelletCount);
 }
 
 // Registers the capacity settings panel with the Mods UI.
@@ -202,18 +208,89 @@ static void on_max_rupee_post(ModContext*, void* args, void* retval, void*) {
     }
 }
 
+static size_t get_current_quiver_index() {
+	if (dComIfGs_isItemFirstBit(dItemNo_ARROW_LV3_e)) { // Giant Quiver
+		return 3;
+	}
+	else if (dComIfGs_isItemFirstBit(dItemNo_ARROW_LV2_e)) { // Big Quiver
+		return 2;
+	}
+    else if (dComIfGs_isItemFirstBit(dItemNo_ARROW_LV1_e)) { // Base Quiver
+        return 1;
+    }
+	return 0; // No bow
+}
+
 // Overrides the arrow maximum for the player's current quiver when configured.
 static void on_max_arrow_post(ModContext*, void*, void* retval, void*) {
-    size_t quiverIndex = 0; // Base Quiver
-    if (dComIfGs_isItemFirstBit(dItemNo_ARROW_LV3_e)) { // Giant Quiver
-        quiverIndex = 2;
-    } else if (dComIfGs_isItemFirstBit(dItemNo_ARROW_LV2_e)) { // Big Quiver
-        quiverIndex = 1;
+	size_t quiverIndex = get_current_quiver_index();
+	if (quiverIndex == 0) {
+		return; // No bow, don't override
+	}
+	u16 currentCustomMax = s_quiverLimits[quiverIndex - 1].value;
+    if (currentCustomMax > 0) {
+        *static_cast<u8*>(retval) = static_cast<u8>(currentCustomMax);
+    }
+}
+// Fixes the various bugs in the quiver display on the collection screen, since it used the hardcoded vanilla quiver maximums.
+static void on_screen_set_post(ModContext* ctx, void* args, void* retval, void* userdata) {
+    // Argument 0 of a member function is `this`
+    dMenu_Collect2D_c* self = mods::arg<dMenu_Collect2D_c*>(args, 0);
+
+    // Overwrite field_0x184[1][3] 
+    size_t quiverIndex = get_current_quiver_index();
+	if (quiverIndex == 1) { // Base Quiver
+        self->field_0x184[1][3] = 0x1b9;
+    }
+	else if (quiverIndex == 2) { // Big Quiver
+        self->field_0x184[1][3] = 0x1ba;
+    }
+	else if (quiverIndex == 3) { // Giant Quiver
+        self->field_0x184[1][3] = 0x1bb;
+    }
+    else { // No bow
+        self->field_0x184[1][3] = 0;
     }
 
-    if (s_quiverLimits[quiverIndex].value > 0) {
-        *static_cast<u8*>(retval) = static_cast<u8>(s_quiverLimits[quiverIndex].value);
+    // Refresh field_0x1d8[1][3] (item description message ID), which screenSet()
+    // already calculated from the old field_0x184[1][3] value
+    self->field_0x1d8[1][3] = self->field_0x184[1][3] + 0x100;
+
+    // If the menu opened with the cursor already on the Quiver slot (1, 3),
+    // refresh the displayed item name and description text boxes
+    if (self->mCursorX == 1 && self->mCursorY == 3) {
+        self->setItemNameString(self->mCursorX, self->mCursorY);
     }
+
+    // Modifies the actual quiver icon in the Collection screen
+    switch (quiverIndex) {
+    case 0: // No bow
+        self->mpScreen->search(MULTI_CHAR('item_0_0'))->hide();
+        self->mpScreen->search(MULTI_CHAR('item_0_1'))->hide();
+        self->mpScreen->search(MULTI_CHAR('item_0_2'))->hide();
+        break;
+	case 1: // Base Quiver
+        self->mpScreen->search(MULTI_CHAR('item_0_0'))->show();
+        self->mpScreen->search(MULTI_CHAR('item_0_1'))->hide();
+        self->mpScreen->search(MULTI_CHAR('item_0_2'))->hide();
+        break;
+	case 2: // Big Quiver
+        self->mpScreen->search(MULTI_CHAR('item_0_0'))->hide();
+        self->mpScreen->search(MULTI_CHAR('item_0_1'))->show();
+        self->mpScreen->search(MULTI_CHAR('item_0_2'))->hide();
+        break;
+	case 3: // Giant Quiver
+        self->mpScreen->search(MULTI_CHAR('item_0_0'))->hide();
+        self->mpScreen->search(MULTI_CHAR('item_0_1'))->hide();
+        self->mpScreen->search(MULTI_CHAR('item_0_2'))->show();
+        break;
+    }
+}
+
+// Fixes the ability to buy arrows beyond the limit in a shop
+static void on_shop_arrows_post(ModContext*, void* args, void* retval, void*) {
+    u16 canBuy = dComIfGs_getArrowNum() >= dComIfGs_getArrowMax() ? 0 : 1;
+	*static_cast<u16*>(retval) = canBuy;
 }
 
 // Overrides the bomb maximum for the bomb type and bag currently in use.
@@ -248,7 +325,7 @@ static void on_ring_get_item_max_post(ModContext*, void* args, void* retval, voi
         return;
     }
 
-    const u8 itemSlot = mods::arg<u8>(args, 1);
+    const u8 itemSlot = mods::arg<u8>(args, 1);  // Get the function argument
     if (dComIfGs_getItem(itemSlot, false) == dItemNo_PACHINKO_e) {
         *static_cast<u8*>(retval) = static_cast<u8>(s_pelletLimit[0].value);
     }
@@ -361,7 +438,7 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         svc_log->error(mod_ctx, "failed to register capacity panel");
         return result;
     }
-
+    // Register hooks
     result = mods::hook::add_post<MaxRupee>(on_max_rupee_post);
     if (result != MOD_OK) {
         svc_log->error(mod_ctx, "failed to install MaxRupee post hook");
@@ -372,6 +449,16 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         svc_log->error(mod_ctx, "failed to install MaxArrow post hook");
         return result;
     }
+    result = mods::hook::add_post<CollectScreenSet>(on_screen_set_post);
+    if (result != MOD_OK) {
+        svc_log->error(mod_ctx, "failed to install CollectScreenSet post hook");
+        return result;
+    }
+	result = mods::hook::add_post<ShopArrows>(on_shop_arrows_post);
+	if (result != MOD_OK) {
+		svc_log->error(mod_ctx, "failed to install ShopArrows post hook");
+		return result;
+	}
     result = mods::hook::add_post<MaxBomb>(on_max_bomb_post);
     if (result != MOD_OK) {
         svc_log->error(mod_ctx, "failed to install MaxBomb post hook");
