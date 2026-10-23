@@ -14,6 +14,7 @@
 #include "d/d_menu_ring.h"
 #include "d/d_menu_collect.h"
 #include "d/d_msg_flow.h"
+#include "d/d_item.h"
 
 #include "f_op/f_op_actor_mng.h" // For hooks
 
@@ -41,42 +42,58 @@ DEFINE_HOOK(&dMenu_Ring_c::getItemMaxNum, RingGetItemMax);
 DEFINE_HOOK(&dMenu_Collect2D_c::screenSet, CollectScreenSet);
 // Corrects the ability to buy arrows beyond the limit in a shop
 DEFINE_HOOK(&dMsgFlow_c::query024, ShopArrows);
+// Hooks to not update the arrow count when getting a bigger quiver
+DEFINE_HOOK(&item_func_ARROW_LV1, GetBigQuiver);
+DEFINE_HOOK(&item_func_ARROW_LV2, GetBigQuiver2);
+DEFINE_HOOK(&item_func_ARROW_LV3, GetGiantQuiver);
+// Hooks to get the right quiver upgrade item when the limit is changed
+DEFINE_HOOK(&item_getcheck_func_ARROW_LV1, CheckBaseQuiver);
+DEFINE_HOOK(&item_getcheck_func_ARROW_LV2, CheckBigQuiver);
+DEFINE_HOOK(&item_getcheck_func_ARROW_LV3, CheckGiantQuiver);
+// Hooks to the max oil count. Dusklight editor already does it well and seems complicated to manage since the oil level is computed directly with the UI. 
+// Oil logic seems to be in d_meter2.cpp/dMeter2_c::moveKantera
+DEFINE_HOOK(&dComIfGs_getMaxOil, MaxOil);
 
 struct LimitSetting {
     const char* name;
     const char* label;
     const char* suffix;
+    u16 defaultValue;
     u16 max;
     ConfigVarHandle var{};
     u16 value{};
 };
 
 static LimitSetting s_walletLimits[] = {
-    {"wallet_limit", "Wallet", " rupees", 9999},
-    {"big_wallet_limit", "Big Wallet", " rupees", 9999},
-    {"giant_wallet_limit", "Giant Wallet", " rupees", 9999},
+    {"wallet_limit", "Wallet", " rupees", 300, 9999},
+    {"big_wallet_limit", "Big Wallet", " rupees", 600, 9999},
+    {"giant_wallet_limit", "Giant Wallet", " rupees", 1000, 9999},
 };
 static LimitSetting s_quiverLimits[] = {
-    {"quiver_limit", "Quiver", " arrows", 255},
-    {"big_quiver_limit", "Big Quiver", " arrows", 255},
-    {"giant_quiver_limit", "Giant Quiver", " arrows", 255},
+    {"quiver_limit", "Quiver", " arrows", 30, 255},
+    {"big_quiver_limit", "Big Quiver", " arrows", 60, 255},
+    {"giant_quiver_limit", "Giant Quiver", " arrows", 100, 255},
 };
 static LimitSetting s_bombLimits[] = {
-    {"regular_bombs_no_giant_bag", "Regular Bombs (Base Bomb Bag)", " bombs", 255},
-    {"water_bombs_no_giant_bag", "Water Bombs (Base Bomb Bag)", " water bombs", 255},
-    {"bomblings_no_giant_bag", "Bomblings (Base Bomb Bag)", " bomblings", 255},
-    {"regular_bombs_giant_bag", "Regular Bombs (Giant Bomb Bag)", " bombs", 255},
-    {"water_bombs_giant_bag", "Water Bombs (Giant Bomb Bag)", " water bombs", 255},
-    {"bomblings_giant_bag", "Bomblings (Giant Bomb Bag)", " bomblings", 255},
+    {"regular_bombs_no_giant_bag", "Regular Bombs (Base Bomb Bag)", " bombs", 30, 255},
+    {"water_bombs_no_giant_bag", "Water Bombs (Base Bomb Bag)", " water bombs", 15, 255},
+    {"bomblings_no_giant_bag", "Bomblings (Base Bomb Bag)", " bomblings", 10, 255},
+    {"regular_bombs_giant_bag", "Regular Bombs (Giant Bomb Bag)", " bombs", 60, 255},
+    {"water_bombs_giant_bag", "Water Bombs (Giant Bomb Bag)", " water bombs", 30, 255},
+    {"bomblings_giant_bag", "Bomblings (Giant Bomb Bag)", " bomblings", 20, 255},
 };
 static LimitSetting s_pelletLimit[] = {
-    {"slingshot_pellets", "Slingshot Pellets", " pellets", 255},
+    {"slingshot_pellets", "Slingshot Pellets", " pellets", 50, 255},
+};
+static LimitSetting s_oilLimit[] = {
+	{"oil_capacity", "Oil Capacity", " units", 21600, 65535},
 };
 
 static constexpr size_t kWalletCount = sizeof(s_walletLimits) / sizeof(s_walletLimits[0]);
 static constexpr size_t kQuiverCount = sizeof(s_quiverLimits) / sizeof(s_quiverLimits[0]);
 static constexpr size_t kBombCount = sizeof(s_bombLimits) / sizeof(s_bombLimits[0]);
 static constexpr size_t kPelletCount = sizeof(s_pelletLimit) / sizeof(s_pelletLimit[0]);
+static constexpr size_t kOilCount = sizeof(s_oilLimit) / sizeof(s_oilLimit[0]);
 // Necessary to handle the slingshot limit, as we can't simply modify the max
 static bool s_pelletMoveCaptured = false;
 static u8 s_pelletCountBefore = 0;
@@ -86,8 +103,8 @@ static u8 s_pelletLimitBefore = 0;
 
 // Clamps a configured capacity to its supported range.
 static u16 clamp_limit(int64_t value, u16 max) {
-    if (value < 0) {
-        return 0;
+    if (value < 1) {
+        return 1;
     }
     if (value > max) {
         return max;
@@ -96,8 +113,7 @@ static u16 clamp_limit(int64_t value, u16 max) {
 }
 
 // Updates a capacity setting when its saved configuration changes.
-static void on_limit_changed(
-    ModContext*, ConfigVarHandle, const ConfigVarValue* value, const ConfigVarValue*, void* userData) {
+static void on_limit_changed(ModContext*, ConfigVarHandle, const ConfigVarValue* value, const ConfigVarValue*, void* userData) {
     auto& setting = *static_cast<LimitSetting*>(userData);
     setting.value = clamp_limit(value->int_value, setting.max);
 }
@@ -108,23 +124,29 @@ static ModResult register_limit_settings(LimitSetting* settings, size_t count) {
         ConfigVarDesc desc = CONFIG_VAR_DESC_INIT;
         desc.name = settings[i].name;
         desc.type = CONFIG_VAR_INT;
-        desc.default_int = 0;
+        desc.default_int = settings[i].defaultValue;
 
         ModResult result = svc_config->register_var(mod_ctx, &desc, &settings[i].var);
         if (result != MOD_OK) {
+            svc_log->error(mod_ctx, "failed register_var in register_limit_settings()");
             return result;
         }
 
-        int64_t value = 0;
-        result = svc_config->get_int(mod_ctx, settings[i].var, &value);
+        int64_t value = settings[i].defaultValue;
+        result = svc_config->get_int(mod_ctx, settings[i].var, &value); // Gets the stored value for the setting
+        if (value == 0) {
+		    result = svc_config->set_int(mod_ctx, settings[i].var, settings[i].defaultValue);
+			value = settings[i].defaultValue; // If the stored value is 0, use the default value instead
+        }
         if (result != MOD_OK) {
+            svc_log->error(mod_ctx, "failed get_int in register_limit_settings()");
             return result;
         }
         settings[i].value = clamp_limit(value, settings[i].max);
 
-        result = svc_config->subscribe(
-            mod_ctx, settings[i].var, on_limit_changed, &settings[i], nullptr);
+		result = svc_config->subscribe(mod_ctx, settings[i].var, on_limit_changed, &settings[i], nullptr); // Calls on_limit_changed() when the setting is changed in the mod UI
         if (result != MOD_OK) {
+            svc_log->error(mod_ctx, "failed subscribe in register_limit_settings()");
             return result;
         }
     }
@@ -145,12 +167,15 @@ static ModResult register_all_limit_settings() {
     if (result != MOD_OK) {
         return result;
     }
+    //result = register_limit_settings(s_oilLimit, kOilCount);
+    //if (result != MOD_OK) {
+    //    return result;
+    //}
     return register_limit_settings(s_pelletLimit, kPelletCount);
 }
 
-// Adds a group of configurable capacity controls to the settings panel.
-static ModResult add_limit_controls(
-    UiElementHandle panel, const char* title, LimitSetting* settings, size_t count) {
+// Adds a group of configurable capacity controls to the mod panel.
+static ModResult add_limit_controls(UiElementHandle panel, const char* title, LimitSetting* settings, size_t count) {
     ModResult result = svc_ui->pane_add_section(mod_ctx, panel, title);
     if (result != MOD_OK) {
         return result;
@@ -162,13 +187,14 @@ static ModResult add_limit_controls(
         control.label = settings[i].label;
         control.binding = UI_BINDING_CONFIG_VAR;
         control.config_var = settings[i].var;
-        control.min = 0;
+        control.min = 1;
         control.max = settings[i].max;
         control.step = 1;
         control.suffix = settings[i].suffix;
 
         result = svc_ui->pane_add_control(mod_ctx, panel, &control, nullptr);
         if (result != MOD_OK) {
+            svc_log->error(mod_ctx, "failed adding control");
             return result;
         }
     }
@@ -179,6 +205,7 @@ static ModResult add_limit_controls(
 static ModResult build_capacity_panel(ModContext*, UiElementHandle panel, void*, ModError*) {
     ModResult result = add_limit_controls(panel, "Wallet Capacities", s_walletLimits, kWalletCount);
     if (result != MOD_OK) {
+        svc_log->error(mod_ctx, "failed building wallet capacity controls");
         return result;
     }
     result = add_limit_controls(panel, "Quiver Capacities", s_quiverLimits, kQuiverCount);
@@ -189,7 +216,13 @@ static ModResult build_capacity_panel(ModContext*, UiElementHandle panel, void*,
     if (result != MOD_OK) {
         return result;
     }
-    return add_limit_controls(panel, "Slingshot Capacities", s_pelletLimit, kPelletCount);
+    result = add_limit_controls(panel, "Slingshot Capacity", s_pelletLimit, kPelletCount);
+    if (result != MOD_OK) {
+        return result;
+    }
+    return result;
+    //return add_limit_controls(panel, "Oil Capacities", s_oilLimit, kOilCount);
+
 }
 
 // Registers the capacity settings panel with the Mods UI.
@@ -203,33 +236,58 @@ static ModResult register_capacity_panel() {
 static void on_max_rupee_post(ModContext*, void* args, void* retval, void*) {
     const auto* playerStatus = mods::arg<const dSv_player_status_a_c*>(args, 0);
 	const u8 walletSize = playerStatus->getWalletSize(); // Returns the index of the current wallet size (0 = base, 1 = big, 2 = giant)
-    if (walletSize < kWalletCount && s_walletLimits[walletSize].value > 0) {
-        *static_cast<u16*>(retval) = s_walletLimits[walletSize].value;
+    u16 currentCustomCapacity = s_walletLimits[walletSize].value;
+	u16 defaultCapacity = s_walletLimits[walletSize].defaultValue;
+    if (currentCustomCapacity != defaultCapacity) {
+        *static_cast<u16*>(retval) = currentCustomCapacity;
     }
 }
 
-static size_t get_current_quiver_index() {
+const size_t NO_BOW_ID = 0;
+const size_t BASE_QUIVER_ID = 1;
+const size_t BIG_QUIVER_ID = 2;
+const size_t GIANT_QUIVER_ID = 3;
+
+static size_t get_current_quiver_id() {
 	if (dComIfGs_isItemFirstBit(dItemNo_ARROW_LV3_e)) { // Giant Quiver
-		return 3;
+		return GIANT_QUIVER_ID;
 	}
 	else if (dComIfGs_isItemFirstBit(dItemNo_ARROW_LV2_e)) { // Big Quiver
-		return 2;
+		return BIG_QUIVER_ID;
 	}
-    else if (dComIfGs_isItemFirstBit(dItemNo_ARROW_LV1_e)) { // Base Quiver
-        return 1;
+    // After testing, the game never seems to give the base quiver when obtaining the Hero's bow, only the bow.
+    else if (dComIfGs_isItemFirstBit(dItemNo_ARROW_LV1_e) || dComIfGs_isItemFirstBit(dItemNo_BOW_e)) { // Base Quiver or Bow
+        return BASE_QUIVER_ID;
     }
-	return 0; // No bow
+	return NO_BOW_ID; // No bow
+}
+
+static void on_getcheck_base_quiver_replace(ModContext*, void*, void* retval, void*) {
+    int ret = get_current_quiver_id() == BASE_QUIVER_ID;
+    *static_cast<int*>(retval) = ret;
+}
+
+static void on_getcheck_big_quiver_replace(ModContext*, void*, void* retval, void*) {
+    int ret = get_current_quiver_id() == BIG_QUIVER_ID;
+    *static_cast<int*>(retval) = ret;
+}
+
+static void on_getcheck_giant_quiver_replace(ModContext*, void*, void* retval, void*) {
+    int ret = get_current_quiver_id() == GIANT_QUIVER_ID;
+    *static_cast<int*>(retval) = ret;
 }
 
 // Overrides the arrow maximum for the player's current quiver when configured.
 static void on_max_arrow_post(ModContext*, void*, void* retval, void*) {
-	size_t quiverIndex = get_current_quiver_index();
-	if (quiverIndex == 0) {
+	size_t quiverID = get_current_quiver_id();
+	if (quiverID == NO_BOW_ID) {
 		return; // No bow, don't override
 	}
-	u16 currentCustomMax = s_quiverLimits[quiverIndex - 1].value;
-    if (currentCustomMax > 0) {
-        *static_cast<u8*>(retval) = static_cast<u8>(currentCustomMax);
+	size_t quiverIndex = quiverID - 1; // Convert to 0-based index
+    u16 currentCustomCapacity = s_quiverLimits[quiverIndex].value;
+    u16 defaultCapacity = s_quiverLimits[quiverIndex].defaultValue;
+    if (currentCustomCapacity != defaultCapacity) {
+        *static_cast<u8*>(retval) = static_cast<u8>(currentCustomCapacity);
     }
 }
 // Fixes the various bugs in the quiver display on the collection screen, since it used the hardcoded vanilla quiver maximums.
@@ -237,24 +295,26 @@ static void on_screen_set_post(ModContext* ctx, void* args, void* retval, void* 
     // Argument 0 of a member function is `this`
     dMenu_Collect2D_c* self = mods::arg<dMenu_Collect2D_c*>(args, 0);
 
-    // Overwrite field_0x184[1][3] 
-    size_t quiverIndex = get_current_quiver_index();
-	if (quiverIndex == 1) { // Base Quiver
-        self->field_0x184[1][3] = 0x1b9;
-    }
-	else if (quiverIndex == 2) { // Big Quiver
-        self->field_0x184[1][3] = 0x1ba;
-    }
-	else if (quiverIndex == 3) { // Giant Quiver
-        self->field_0x184[1][3] = 0x1bb;
-    }
-    else { // No bow
-        self->field_0x184[1][3] = 0;
+    // field_0x184[1][3] seems to be the message ID for the quiver text in the Collection screen.
+    size_t quiverID = get_current_quiver_id();
+    switch (quiverID) {
+	    case NO_BOW_ID:
+		    self->field_0x184[1][3] = 0;  // No text
+		    break;
+	    case BASE_QUIVER_ID:
+		    self->field_0x184[1][3] = 0x1b9;  // Base Quiver text
+		    break;
+	    case BIG_QUIVER_ID:
+		    self->field_0x184[1][3] = 0x1ba;  // Big Quiver text
+		    break;
+        case GIANT_QUIVER_ID:
+		    self->field_0x184[1][3] = 0x1bb;  // Giant Quiver text
+		    break;
     }
 
     // Refresh field_0x1d8[1][3] (item description message ID), which screenSet()
     // already calculated from the old field_0x184[1][3] value
-    self->field_0x1d8[1][3] = self->field_0x184[1][3] + 0x100;
+    self->field_0x1d8[1][3] = self->field_0x184[1][3] + 0x100;  // No clue what this does
 
     // If the menu opened with the cursor already on the Quiver slot (1, 3),
     // refresh the displayed item name and description text boxes
@@ -263,28 +323,29 @@ static void on_screen_set_post(ModContext* ctx, void* args, void* retval, void* 
     }
 
     // Modifies the actual quiver icon in the Collection screen
-    switch (quiverIndex) {
-    case 0: // No bow
-        self->mpScreen->search(MULTI_CHAR('item_0_0'))->hide();
-        self->mpScreen->search(MULTI_CHAR('item_0_1'))->hide();
-        self->mpScreen->search(MULTI_CHAR('item_0_2'))->hide();
-        break;
-	case 1: // Base Quiver
-        self->mpScreen->search(MULTI_CHAR('item_0_0'))->show();
-        self->mpScreen->search(MULTI_CHAR('item_0_1'))->hide();
-        self->mpScreen->search(MULTI_CHAR('item_0_2'))->hide();
-        break;
-	case 2: // Big Quiver
-        self->mpScreen->search(MULTI_CHAR('item_0_0'))->hide();
-        self->mpScreen->search(MULTI_CHAR('item_0_1'))->show();
-        self->mpScreen->search(MULTI_CHAR('item_0_2'))->hide();
-        break;
-	case 3: // Giant Quiver
-        self->mpScreen->search(MULTI_CHAR('item_0_0'))->hide();
-        self->mpScreen->search(MULTI_CHAR('item_0_1'))->hide();
-        self->mpScreen->search(MULTI_CHAR('item_0_2'))->show();
-        break;
-    }
+	// item_0_0 = Base Quiver, item_0_1 = Big Quiver, item_0_2 = Giant Quiver
+    switch (quiverID) {
+        case NO_BOW_ID: // Hide all quivers
+            self->mpScreen->search(MULTI_CHAR('item_0_0'))->hide();
+            self->mpScreen->search(MULTI_CHAR('item_0_1'))->hide();
+            self->mpScreen->search(MULTI_CHAR('item_0_2'))->hide();
+            break;
+		case BASE_QUIVER_ID: // Show Base Quiver, hide others
+            self->mpScreen->search(MULTI_CHAR('item_0_0'))->show();
+            self->mpScreen->search(MULTI_CHAR('item_0_1'))->hide();
+            self->mpScreen->search(MULTI_CHAR('item_0_2'))->hide();
+            break;
+		case BIG_QUIVER_ID: // Show Big Quiver, hide others
+            self->mpScreen->search(MULTI_CHAR('item_0_0'))->hide();
+            self->mpScreen->search(MULTI_CHAR('item_0_1'))->show();
+            self->mpScreen->search(MULTI_CHAR('item_0_2'))->hide();
+            break;
+		case GIANT_QUIVER_ID: // Show Giant Quiver, hide others
+            self->mpScreen->search(MULTI_CHAR('item_0_0'))->hide();
+            self->mpScreen->search(MULTI_CHAR('item_0_1'))->hide();
+            self->mpScreen->search(MULTI_CHAR('item_0_2'))->show();
+            break;
+    }   
 }
 
 // Fixes the ability to buy arrows beyond the limit in a shop
@@ -293,35 +354,54 @@ static void on_shop_arrows_post(ModContext*, void* args, void* retval, void*) {
 	*static_cast<u16*>(retval) = canBuy;
 }
 
+// Prevents the arrow count from being set to the base game max when getting a bigger quiver
+static void on_big_quiver_get_replace(ModContext*, void* args, void*, void*) {
+	size_t bigQuiverIndex = BIG_QUIVER_ID - 1;
+	if (s_quiverLimits[bigQuiverIndex].value == s_quiverLimits[bigQuiverIndex].defaultValue) {  // Keep the same behaviour as the base game if the value is the default
+		dComIfGs_setArrowNum(s_quiverLimits[bigQuiverIndex].defaultValue);
+        dComIfGs_setArrowMax(s_quiverLimits[bigQuiverIndex].defaultValue);
+	}
+}
+// Prevents the arrow count from being set to the base game max when getting a bigger quiver
+static void on_giant_quiver_get_replace(ModContext*, void* args, void*, void*) {
+	size_t giantQuiverIndex = GIANT_QUIVER_ID - 1;
+	if (s_quiverLimits[giantQuiverIndex].value == s_quiverLimits[giantQuiverIndex].defaultValue) { // Keep the same behaviour as the base game if the value is the default
+		dComIfGs_setArrowNum(s_quiverLimits[giantQuiverIndex].defaultValue);
+		dComIfGs_setArrowMax(s_quiverLimits[giantQuiverIndex].defaultValue);
+	}
+}
+
 // Overrides the bomb maximum for the bomb type and bag currently in use.
 static void on_max_bomb_post(ModContext*, void* args, void* retval, void*) {
     const u8 bombType = mods::arg<u8>(args, 1);
     size_t bombIndex;
-    switch (bombType) {
-    case dItemNo_NORMAL_BOMB_e: // Regular Bombs
-        bombIndex = 0;
-        break;
-    case dItemNo_WATER_BOMB_e: // Water Bombs
-        bombIndex = 1;
-        break;
-    case dItemNo_POKE_BOMB_e: // Bomblings
-        bombIndex = 2;
-        break;
-    default:
-        return;
+    switch (bombType) { // Normal Bomb Bag capacities
+        case dItemNo_NORMAL_BOMB_e: // Regular Bombs
+            bombIndex = 0;
+            break;
+        case dItemNo_WATER_BOMB_e: // Water Bombs
+            bombIndex = 1;
+            break;
+        case dItemNo_POKE_BOMB_e: // Bomblings
+            bombIndex = 2;
+            break;
+        default:
+            return;
     }
 
     if (dComIfGs_isItemFirstBit(dItemNo_BOMB_BAG_LV2_e)) { // If the Giant Bomb Bag is obtained
-        bombIndex += 3;
+        bombIndex += 3;  // Use the Giant Bomb Bag capacities
     }
-    if (s_bombLimits[bombIndex].value > 0) {
-        *static_cast<u8*>(retval) = static_cast<u8>(s_bombLimits[bombIndex].value);
+    u16 currentCustomCapacity = s_bombLimits[bombIndex].value;
+    u16 defaultCapacity = s_bombLimits[bombIndex].defaultValue;
+    if (currentCustomCapacity != defaultCapacity) {
+        *static_cast<u8*>(retval) = static_cast<u8>(currentCustomCapacity);
     }
 }
 
 // Supplies the configured pellet maximum to the item wheel's full-capacity check.
 static void on_ring_get_item_max_post(ModContext*, void* args, void* retval, void*) {
-    if (s_pelletLimit[0].value == 0) {
+    if (s_pelletLimit[0].value == s_pelletLimit[0].defaultValue) {
         return;
     }
 
@@ -379,10 +459,9 @@ static void on_ring_draw_number_replace(ModContext*, void* args, void*, void*) {
 // Captures pellet state before the game applies its vanilla count limit.
 static HookAction on_pachinko_move_pre(ModContext*, void* args, void*, void*) {
     s_pelletMoveCaptured = false;
-    if (s_pelletLimit[0].value == 0) {
+    if (s_pelletLimit[0].value == s_pelletLimit[0].defaultValue) {
         return HOOK_CONTINUE;
     }
-
     s_pelletCountBefore = dComIfGs_getPachinkoNum();
     s_pelletDeltaBefore = dComIfGp_getItemPachinkoNumCount();
     auto* meter = mods::arg<dMeter2_c*>(args, 0);
@@ -394,7 +473,7 @@ static HookAction on_pachinko_move_pre(ModContext*, void* args, void*, void*) {
 
 // Applies the configured pellet limit and refreshes the meter display.
 static void on_pachinko_move_post(ModContext*, void* args, void*, void*) {
-    if (!s_pelletMoveCaptured) {
+	if (!s_pelletMoveCaptured) {  // Skip if the pre-hook didn't capture the pellet state (i.e., the limit is the default)
         return;
     }
 
@@ -421,6 +500,14 @@ static void on_pachinko_move_post(ModContext*, void* args, void*, void*) {
         }
     }
     s_pelletMoveCaptured = false;
+}
+
+static void on_max_oil_post(ModContext*, void* args, void* retval, void*) {
+    u16 currentCustomCapacity = s_oilLimit[0].value;
+    u16 defaultCapacity = s_oilLimit[0].defaultValue;
+    if (currentCustomCapacity != defaultCapacity) {
+        *static_cast<u16*>(retval) = currentCustomCapacity;
+    }
 }
 
 extern "C" {
@@ -459,6 +546,36 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
 		svc_log->error(mod_ctx, "failed to install ShopArrows post hook");
 		return result;
 	}
+    result = mods::hook::replace<GetBigQuiver>(on_big_quiver_get_replace);
+    if (result != MOD_OK) {
+        svc_log->error(mod_ctx, "failed to install GetBigQuiver post hook");
+        return result;
+    }
+    result = mods::hook::replace<GetBigQuiver2>(on_big_quiver_get_replace);
+    if (result != MOD_OK) {
+        svc_log->error(mod_ctx, "failed to install GetBigQuiver2 post hook");
+        return result;
+    }
+    result = mods::hook::replace<GetGiantQuiver>(on_giant_quiver_get_replace);
+    if (result != MOD_OK) {
+        svc_log->error(mod_ctx, "failed to install GetGiantQuiver post hook");
+        return result;
+    }
+	result = mods::hook::replace<CheckBaseQuiver>(on_getcheck_base_quiver_replace);
+	if (result != MOD_OK) {
+		svc_log->error(mod_ctx, "failed to install CheckBaseQuiver replace hook");
+		return result;
+	}
+	result = mods::hook::replace<CheckBigQuiver>(on_getcheck_big_quiver_replace);   
+	if (result != MOD_OK) {
+		svc_log->error(mod_ctx, "failed to install CheckBigQuiver replace hook");
+		return result;
+	}
+	result = mods::hook::replace<CheckGiantQuiver>(on_getcheck_giant_quiver_replace);
+	if (result != MOD_OK) {
+		svc_log->error(mod_ctx, "failed to install CheckGiantQuiver replace hook");
+		return result;
+	}
     result = mods::hook::add_post<MaxBomb>(on_max_bomb_post);
     if (result != MOD_OK) {
         svc_log->error(mod_ctx, "failed to install MaxBomb post hook");
@@ -484,6 +601,11 @@ MOD_EXPORT ModResult mod_initialize(ModError*) {
         svc_log->error(mod_ctx, "failed to install PachinkoNumMove post hook");
         return result;
     }
+    //result = mods::hook::add_post<MaxOil>(on_max_oil_post);
+    //if (result != MOD_OK) {
+    //    svc_log->error(mod_ctx, "failed to install MaxOil post hook");
+    //    return result;
+    //}
 
     svc_log->info(mod_ctx, "Custom Capacities initialized");
     return MOD_OK;

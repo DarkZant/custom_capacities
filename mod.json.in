@@ -3,7 +3,7 @@
   "name": "Custom Capacities",
   "version": "@PROJECT_VERSION@",
   "author": "DarkZant",
-  "description": "Customize the capacities of Wallets, Bomb Bags, Quivers and Slingshot Pellets. 0 uses the game's current maximum capacity. Changing capacities instantly updates your item amounts, so be careful with lower capacities causing you to lose items.",
+  "description": "Customize the capacities of Wallets, Bomb Bags, Quivers and Slingshot Pellets. Leaving the default value does not override other settings/mods (example: Bigger Wallets setting). Changing capacities instantly updates your item amounts, so be careful with lower capacities causing you to lose items.",
   "icon": "res/icon.png",
   "banner": "res/banner.png",
   "abi": 1,
